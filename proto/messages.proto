@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package distributed_txn;
+
+option go_package = "./proto";
+
+// Message types for the distributed transaction system
+
+// Transaction represents a transfer transaction
+message Transaction {
+  int32 sender = 1;
+  int32 receiver = 2;
+  int32 amount = 3;
+  string consistency_level = 4; // For bonus: "linearizable", "eventual", etc.
+}
+
+// Client request message
+message ClientRequest {
+  enum RequestType {
+    BALANCE = 0;
+    TRANSFER = 1;
+  }
+  RequestType type = 1;
+  int32 client_id = 2;
+  Transaction transaction = 3;
+  int64 timestamp = 4;
+  string request_id = 5;
+}
+
+// Client response message
+message ClientResponse {
+  bool success = 1;
+  int32 balance = 2;
+  string message = 3;
+  string request_id = 4;
+}
+
+// Paxos messages
+message AcceptMessage {
+  int32 ballot_number = 1;
+  int32 sequence_number = 2;
+  string phase = 3; // "P" (prepare), "C" (commit), "A" (abort), or "" (normal)
+  ClientRequest request = 4;
+  int32 sender_id = 5;
+}
+
+message AcceptedMessage {
+  int32 ballot_number = 1;
+  int32 sequence_number = 2;
+  int32 sender_id = 3;
+  bool accepted = 4;
+}
+
+message CommitMessage {
+  int32 sequence_number = 1;
+  ClientRequest request = 2;
+  string phase = 3;
+}
+
+message PrepareMessage {
+  int32 ballot_number = 1;
+  int32 sender_id = 2;
+}
+
+message PromiseMessage {
+  int32 ballot_number = 1;
+  int32 sender_id = 2;
+  repeated LogEntry accepted_values = 3;
+}
+
+message NewViewMessage {
+  int32 ballot_number = 1;
+  int32 new_leader_id = 2;
+  int64 timestamp = 3;
+}
+
+// 2PC messages
+message TwoPCPrepare {
+  Transaction transaction = 1;
+  ClientRequest original_request = 2;
+  string request_id = 3;
+}
+
+message TwoPCPrepared {
+  Transaction transaction = 1;
+  string request_id = 2;
+  bool success = 3;
+}
+
+message TwoPCCommit {
+  Transaction transaction = 1;
+  string request_id = 2;
+}
+
+message TwoPCAbort {
+  Transaction transaction = 1;
+  string request_id = 2;
+}
+
+message TwoPCAck {
+  Transaction transaction = 1;
+  string request_id = 2;
+  bool success = 4;
+}
+
+// Log entry for Paxos
+message LogEntry {
+  int32 sequence_number = 1;
+  int32 ballot_number = 2;
+  ClientRequest request = 3;
+  string phase = 4;
+  bool committed = 5;
+}
+
+// WAL entry for undo
+message WALEntry {
+  string request_id = 1;
+  int32 data_item = 2;
+  int32 old_balance = 3;
+  int32 new_balance = 4;
+  int64 timestamp = 5;
+}
+
+// Balance request/response
+message BalanceRequest {
+  int32 client_id = 1;
+}
+
+message BalanceResponse {
+  int32 balance = 1;
+  int32 node_id = 2;
+}
+
+// Service definitions
+service NodeService {
+  // Client requests
+  rpc ProcessRequest(ClientRequest) returns (ClientResponse);
+  rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+  
+  // Paxos messages
+  rpc SendAccept(AcceptMessage) returns (AcceptedMessage);
+  rpc SendCommit(CommitMessage) returns (Empty);
+  rpc SendPrepare(PrepareMessage) returns (PromiseMessage);
+  rpc SendNewView(NewViewMessage) returns (Empty);
+  
+  // 2PC messages
+  rpc Send2PCPrepare(TwoPCPrepare) returns (TwoPCPrepared);
+  rpc Send2PCCommit(TwoPCCommit) returns (TwoPCAck);
+  rpc Send2PCAbort(TwoPCAbort) returns (TwoPCAck);
+  
+  // Control messages
+  rpc FailNode(Empty) returns (Empty);
+  rpc RecoverNode(Empty) returns (Empty);
+}
+
+message Empty {}
