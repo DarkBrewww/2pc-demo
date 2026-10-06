@@ -12,9 +12,21 @@ import (
 	"google.golang.org/grpc"
 )
 
+const (
+	// RetryWindow is how long the client keeps looking for a node that can answer
+	// (long enough for a cluster to elect a new leader after a failure).
+	RetryWindow = 5 * time.Second
+	// CallTimeout bounds a single attempt; a cross-shard transfer can wait a few
+	// seconds for the other cluster before aborting.
+	CallTimeout = 10 * time.Second
+	// RetryPause is the pause between rounds over the cluster's nodes.
+	RetryPause = 150 * time.Millisecond
+)
+
 type Client struct {
 	// Leader connections for each cluster
-	leaders map[int32]pb.NodeServiceClient
+	leaders    map[int32]pb.NodeServiceClient
+	leaderHint map[int32]int // index of the node that answered last time
 
 	// All node connections for each cluster (for retries)
 	clusterNodes map[int32][]pb.NodeServiceClient
@@ -30,6 +42,7 @@ type Client struct {
 func NewClient() *Client {
 	return &Client{
 		leaders:          make(map[int32]pb.NodeServiceClient),
+		leaderHint:       make(map[int32]int),
 		clusterNodes:     make(map[int32][]pb.NodeServiceClient),
 		transactionTimes: make(map[string]time.Time),
 	}
@@ -90,16 +103,7 @@ func (c *Client) SendBalanceRequest(ctx context.Context, clientID int32) (*pb.Cl
 	c.transactionTimes[requestID] = time.Now()
 	c.mu.Unlock()
 
-	leader := c.leaders[clusterID]
-	resp, err := leader.ProcessRequest(ctx, req)
-
-	if err != nil || !resp.Success {
-		// Retry with other nodes
-		return c.retryRequest(ctx, clusterID, req)
-	}
-
-	c.recordLatency(requestID)
-	return resp, nil
+	return c.retryRequest(ctx, clusterID, req)
 }
 
 // SendTransferRequest sends a transfer transaction
@@ -129,47 +133,59 @@ func (c *Client) SendTransferRequest(ctx context.Context, sender, receiver, amou
 	c.transactionTimes[requestID] = time.Now()
 	c.mu.Unlock()
 
-	// Send to the leader of sender's cluster (coordinator)
-	leader := c.leaders[senderCluster]
-	resp, err := leader.ProcessRequest(ctx, req)
-
-	if err != nil || !resp.Success {
-		// Retry with other nodes
-		return c.retryRequest(ctx, senderCluster, req)
-	}
-
-	c.recordLatency(requestID)
-	return resp, nil
+	// Send to the leader of sender's cluster (coordinator); any node forwards to it
+	return c.retryRequest(ctx, senderCluster, req)
 }
 
-// retryRequest retries a request with different nodes in the cluster
+// retryRequest sends a request to the cluster, starting with the node that answered
+// last time. A node that is failed or has no leader returns an error, so the client
+// moves on to the next node and keeps cycling until a new leader is elected or
+// RetryWindow expires. A definitive answer (committed, insufficient balance,
+// aborted, ...) is returned as is and never retried: retrying an aborted transfer
+// would just run it again.
 func (c *Client) retryRequest(ctx context.Context, clusterID int32, req *pb.ClientRequest) (*pb.ClientResponse, error) {
 	nodes := c.clusterNodes[clusterID]
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("no connections to cluster %d", clusterID)
+	}
 
-	// Try the whole cluster up to 3 times
-	maxClusterRetries := 3
+	c.mu.Lock()
+	hint := c.leaderHint[clusterID]
+	c.mu.Unlock()
 
-	for attempt := 0; attempt < maxClusterRetries; attempt++ {
-		// Try every node in the cluster
-		for _, node := range nodes {
-			resp, err := node.ProcessRequest(ctx, req)
-			if err == nil && resp.Success {
-				c.recordLatency(req.RequestId)
-				return resp, nil
+	deadline := time.Now().Add(RetryWindow)
+	var lastErr error
+	for {
+		for i := 0; i < len(nodes); i++ {
+			idx := (hint + i) % len(nodes)
+			callCtx, cancel := context.WithTimeout(ctx, CallTimeout)
+			resp, err := nodes[idx].ProcessRequest(callCtx, req)
+			cancel()
+			if err != nil {
+				lastErr = err
+				continue
 			}
+
+			c.mu.Lock()
+			c.leaderHint[clusterID] = idx
+			c.mu.Unlock()
+			if resp.Success {
+				c.recordLatency(req.RequestId)
+			}
+			return resp, nil
 		}
 
-		// If we are here, all nodes failed.
-		// Wait a bit for a new leader to be elected before trying the cluster again.
-		if attempt < maxClusterRetries-1 {
-			time.Sleep(500 * time.Millisecond)
+		// No node could answer. Wait a bit for a new leader to be elected.
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			break
 		}
+		time.Sleep(RetryPause)
 	}
 
 	return &pb.ClientResponse{
 		Success: false,
 		Message: "All nodes failed or unavailable after retries",
-	}, fmt.Errorf("all retry attempts failed")
+	}, fmt.Errorf("all retry attempts failed: %v", lastErr)
 }
 
 func (c *Client) recordLatency(requestID string) {

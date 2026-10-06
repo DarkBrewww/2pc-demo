@@ -6,12 +6,38 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
 	pb "2pc-DarkBrewww/proto"
 
 	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	// HeartbeatInterval is how often a leader pings its followers.
+	HeartbeatInterval = 100 * time.Millisecond
+	// A follower that hears nothing from the leader for FollowerTimeoutBase plus a
+	// random jitter starts an election. It must be several heartbeat intervals long,
+	// otherwise followers time out between heartbeats and leadership flaps.
+	FollowerTimeoutBase   = 600 * time.Millisecond
+	FollowerTimeoutJitter = 400 * time.Millisecond
+
+	// AcceptWait bounds how long a leader waits for Accepted replies.
+	AcceptWait = 500 * time.Millisecond
+	// PrepareWait bounds how long a candidate waits for Promises.
+	PrepareWait = 300 * time.Millisecond
+
+	// PhaseHeartbeat marks heartbeat messages; PhaseNoOp fills log gaps after a leader change.
+	PhaseHeartbeat = "HEARTBEAT"
+	PhaseNoOp      = "NOOP"
+
+	mdEpoch     = "x-epoch"
+	mdForwarded = "x-forwarded"
 )
 
 type Node struct {
@@ -68,16 +94,29 @@ type Node struct {
 	// Cross-cluster connections (to leaders of other clusters)
 	CoordinatorClients map[int32]pb.NodeServiceClient
 
+	// Every node of each other cluster, so 2PC messages reach that cluster's
+	// current leader even after its default leader fails.
+	ClusterClients  map[int32][]pb.NodeServiceClient
+	participantHint map[int32]int // index of the node that last answered for each cluster
+
 	// Performance metrics
 	txnStartTimes map[string]time.Time
 	completedTxns int64
 	totalLatency  time.Duration
 
 	// Client request deduplication
-	clientLastReply map[string]*pb.ClientResponse
+	clientLastReply map[string]*pb.ClientResponse // final outcome of each executed request (replicated)
 	seenRequests    map[string]int64
 
 	PeerSyncStatus map[int32]bool // peer_id -> is_synced
+
+	// 2PC participant bookkeeping: request_id -> data item locked for it
+	preparedTxns map[string]int32
+
+	bgCtx     context.Context
+	leaderGen int64 // changes whenever this node starts or stops leading; stops stale heartbeat loops
+	epoch     int64 // bumped by Flush; replication traffic from an older test set is dropped
+	electing  bool
 }
 
 func NewNode(id, clusterID int32, port string, clusterNodes []string, dataRange [2]int32) (*Node, error) {
@@ -100,18 +139,26 @@ func NewNode(id, clusterID int32, port string, clusterNodes []string, dataRange 
 		return nil, err
 	}
 
-	// Initialize balances for this shard's data range
-	stmt, err := db.Prepare("INSERT OR REPLACE INTO balances (client_id, balance) VALUES (?, ?)")
+	// Initialize balances for this shard's data range (one transaction instead of 3000)
+	tx, err := db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	defer stmt.Close()
-
+	stmt, err := tx.Prepare("INSERT OR REPLACE INTO balances (client_id, balance) VALUES (?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
 	for i := dataRange[0]; i <= dataRange[1]; i++ {
-		_, err = stmt.Exec(i, 10)
-		if err != nil {
+		if _, err = stmt.Exec(i, 10); err != nil {
+			stmt.Close()
+			tx.Rollback()
 			return nil, err
 		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	node := &Node{
@@ -134,16 +181,83 @@ func NewNode(id, clusterID int32, port string, clusterNodes []string, dataRange 
 		WAL:                make(map[string][]*pb.WALEntry),
 		DB:                 db,
 		Failed:             false,
-		leaderTimeout:      10 * time.Second, // Increased timeout to prevent immediate elections
+		leaderTimeout:      FollowerTimeoutBase,
 		Peers:              make(map[int32]pb.NodeServiceClient),
 		CoordinatorClients: make(map[int32]pb.NodeServiceClient),
+		ClusterClients:     make(map[int32][]pb.NodeServiceClient),
+		participantHint:    make(map[int32]int),
 		txnStartTimes:      make(map[string]time.Time),
 		clientLastReply:    make(map[string]*pb.ClientResponse),
 		seenRequests:       make(map[string]int64),
 		PeerSyncStatus:     make(map[int32]bool),
+		preparedTxns:       make(map[string]int32),
+		bgCtx:              context.Background(),
 	}
 
 	return node, nil
+}
+
+// --- Small helpers ---
+
+func (n *Node) majority() int {
+	return len(n.ClusterNodes)/2 + 1
+}
+
+// nextBallot returns a ballot above every ballot this node has seen. The node ID is
+// the last digit, so two candidates can never use the same ballot (which let two
+// nodes win the same election before).
+func (n *Node) nextBallot() int32 {
+	return (n.BallotNumber/10+1)*10 + n.ID
+}
+
+// withEpoch tags an outgoing replication message with this node's test-set epoch.
+func withEpoch(ctx context.Context, epoch int64) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, mdEpoch, strconv.FormatInt(epoch, 10))
+}
+
+// epochOK reports whether an incoming message belongs to the current test set.
+// MUST be called with the lock held.
+func (n *Node) epochOK(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return true
+	}
+	vals := md.Get(mdEpoch)
+	if len(vals) == 0 {
+		return true
+	}
+	e, err := strconv.ParseInt(vals[0], 10, 64)
+	return err != nil || e == n.epoch
+}
+
+func isForwarded(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	return ok && len(md.Get(mdForwarded)) > 0
+}
+
+func forwardCtx(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, mdForwarded, "1")
+}
+
+var errNotLeader = status.Error(codes.Unavailable, "not the leader")
+
+// becomeFollower demotes this node and points it at leaderID (-1 if unknown).
+// MUST be called with the lock held.
+func (n *Node) becomeFollower(leaderID int32) {
+	if n.State == "LEADER" || n.IsLeader {
+		log.Printf("[Node %d] Stepping down from LEADER", n.ID)
+		n.leaderGen++ // stops the heartbeat loop of the old term
+	}
+	n.State = "FOLLOWER"
+	n.IsLeader = false
+	n.CurrentLeader = leaderID
+	n.resetFollowerTimer()
+}
+
+// isReadyLeader reports whether this node may serve client and 2PC requests.
+// MUST be called with the lock held.
+func (n *Node) isReadyLeader() bool {
+	return !n.Failed && n.IsLeader && n.State == "LEADER" && !n.Recovering
 }
 
 // StartFollowerTimer starts the follower timeout timer (called after leader is set)
@@ -160,117 +274,130 @@ func (n *Node) StartFollowerTimer() {
 	}
 }
 
-// StartHeartbeat sends periodic heartbeats to followers
+// StartHeartbeat sends periodic heartbeats to followers for the current leadership term
 func (n *Node) StartHeartbeat(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				n.mu.RLock()
-				if !n.IsLeader || n.Failed || n.State != "LEADER" {
-					n.mu.RUnlock()
-					return
-				}
-				ballotNum := n.BallotNumber
-				leaderSeq := n.LastExecutedSeq
-				n.mu.RUnlock()
-
-				heartbeatMsg := &pb.AcceptMessage{
-					BallotNumber:   ballotNum,
-					SequenceNumber: leaderSeq,
-					Phase:          "HEARTBEAT",
-					SenderId:       n.ID,
-				}
-
-				// CHANGE: Iterate with peerID to track status
-				for peerID, peer := range n.Peers {
-
-					// Check if we are already syncing this peer
-					n.mu.Lock()
-					isSyncing := n.PeerSyncStatus[peerID]
-					n.mu.Unlock()
-
-					// If syncing, SKIP this heartbeat cycle for this peer logic
-					if isSyncing {
-						continue
-					}
-
-					go func(pID int32, p pb.NodeServiceClient) {
-						hbCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-						defer cancel()
-
-						resp, err := p.SendAccept(hbCtx, heartbeatMsg)
-
-						if err == nil && resp != nil {
-							// If Follower is behind, trigger sync
-							if resp.SequenceNumber < leaderSeq {
-								// Mark as syncing to prevent overlap
-								n.mu.Lock()
-								n.PeerSyncStatus[pID] = true
-								n.mu.Unlock()
-
-								// Perform sync
-								n.syncFollower(p, resp.SequenceNumber+1, leaderSeq)
-
-								// Unmark when done
-								n.mu.Lock()
-								n.PeerSyncStatus[pID] = false
-								n.mu.Unlock()
-							}
-						}
-					}(peerID, peer)
-				}
-			}
-		}
-	}()
+	n.mu.Lock()
+	n.bgCtx = ctx
+	gen := n.leaderGen
+	n.mu.Unlock()
+	go n.heartbeatLoop(gen)
 }
 
-// syncFollower pushes missing logs to a stale follower
-func (n *Node) syncFollower(peer pb.NodeServiceClient, startSeq, endSeq int32) {
-	// Don't sync if gap is huge or invalid
+func (n *Node) heartbeatLoop(gen int64) {
+	n.mu.RLock()
+	bgCtx := n.bgCtx
+	n.mu.RUnlock()
+
+	ticker := time.NewTicker(HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-bgCtx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		n.mu.Lock()
+		if n.leaderGen != gen || !n.IsLeader || n.Failed || n.State != "LEADER" {
+			n.mu.Unlock()
+			return
+		}
+		ballotNum := n.BallotNumber
+		leaderSeq := n.LastExecutedSeq
+		epoch := n.epoch
+		n.mu.Unlock()
+
+		heartbeatMsg := &pb.AcceptMessage{
+			BallotNumber:   ballotNum,
+			SequenceNumber: leaderSeq,
+			Phase:          PhaseHeartbeat,
+			SenderId:       n.ID,
+		}
+
+		for peerID, peer := range n.Peers {
+			// Skip peers we are already syncing
+			n.mu.Lock()
+			isSyncing := n.PeerSyncStatus[peerID]
+			n.mu.Unlock()
+			if isSyncing {
+				continue
+			}
+
+			go func(pID int32, p pb.NodeServiceClient) {
+				hbCtx, cancel := context.WithTimeout(withEpoch(bgCtx, epoch), 300*time.Millisecond)
+				defer cancel()
+
+				resp, err := p.SendAccept(hbCtx, heartbeatMsg)
+				if err != nil || resp == nil {
+					return
+				}
+
+				if !resp.Accepted {
+					// The follower promised a higher ballot: a newer leader exists.
+					if resp.BallotNumber > ballotNum {
+						n.mu.Lock()
+						if n.leaderGen == gen && n.State == "LEADER" {
+							if resp.BallotNumber > n.BallotNumber {
+								n.BallotNumber = resp.BallotNumber
+							}
+							n.becomeFollower(-1)
+						}
+						n.mu.Unlock()
+					}
+					return
+				}
+
+				// If the follower is behind, push the committed entries it is missing
+				if resp.SequenceNumber < leaderSeq {
+					n.mu.Lock()
+					if n.PeerSyncStatus[pID] {
+						n.mu.Unlock()
+						return
+					}
+					n.PeerSyncStatus[pID] = true
+					n.mu.Unlock()
+
+					n.syncFollower(p, resp.SequenceNumber+1, leaderSeq, epoch)
+
+					n.mu.Lock()
+					n.PeerSyncStatus[pID] = false
+					n.mu.Unlock()
+				}
+			}(peerID, peer)
+		}
+	}
+}
+
+// syncFollower pushes missing committed log entries to a stale follower
+func (n *Node) syncFollower(peer pb.NodeServiceClient, startSeq, endSeq int32, epoch int64) {
 	if startSeq > endSeq {
 		return
 	}
-
-	// log.Printf("[Node %d] Syncing follower from %d to %d", n.ID, startSeq, endSeq)
+	log.Printf("[Node %d] Syncing follower from seq %d to %d", n.ID, startSeq, endSeq)
 
 	for seq := startSeq; seq <= endSeq; seq++ {
 		n.mu.RLock()
 		entry, exists := n.CommittedLog[seq]
+		stale := n.epoch != epoch
 		n.mu.RUnlock()
 
-		if !exists {
-			continue
+		if stale || !exists {
+			return
 		}
 
-		// Re-construct the Accept Message (Proposal)
-		acceptMsg := &pb.AcceptMessage{
-			BallotNumber:   entry.BallotNumber,
-			SequenceNumber: entry.SequenceNumber,
-			Phase:          entry.Phase,
-			Request:        entry.Request,
-			SenderId:       n.ID,
-		}
-
-		// Re-construct the Commit Message
 		commitMsg := &pb.CommitMessage{
 			SequenceNumber: entry.SequenceNumber,
 			Request:        entry.Request,
 			Phase:          entry.Phase,
 		}
 
-		// In syncFollower:
-		// Use a timeout context instead of Background()
-		syncCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-
-		peer.SendAccept(syncCtx, acceptMsg)
-		peer.SendCommit(syncCtx, commitMsg)
+		syncCtx, cancel := context.WithTimeout(withEpoch(context.Background(), epoch), 2*time.Second)
+		_, err := peer.SendCommit(syncCtx, commitMsg)
+		cancel()
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -300,39 +427,38 @@ func (n *Node) ProcessRequest(ctx context.Context, req *pb.ClientRequest) (*pb.C
 	n.mu.Lock()
 	if n.Failed {
 		n.mu.Unlock()
-		return nil, fmt.Errorf("node is failed")
+		return nil, status.Error(codes.Unavailable, "node is failed")
 	}
 
-	// Check for duplicate request
-	reqKey := req.RequestId
-	if lastReply, ok := n.clientLastReply[reqKey]; ok {
-		n.mu.Unlock()
-		log.Printf("[Node %d] Deduplication cache hit for %s", n.ID, reqKey)
-		return lastReply, nil
-	}
-
-	// Track start time for latency measurement
-	n.txnStartTimes[req.RequestId] = time.Now()
-
-	// If not leader, redirect
-	if !n.IsLeader || n.State != "LEADER" {
+	// If not leader, redirect (once: a forwarded request is never forwarded again,
+	// which used to bounce forever between two nodes that each thought the other led)
+	if !n.isReadyLeader() {
 		leaderId := n.CurrentLeader
 		state := n.State
 		n.mu.Unlock()
 
-		log.Printf("[Node %d] Not leader (state=%s, leader=%d), redirecting", n.ID, state, leaderId)
-
-		if leaderId > 0 {
-			if peer, ok := n.Peers[leaderId]; ok {
-				return peer.ProcessRequest(ctx, req)
-			}
+		if isForwarded(ctx) || leaderId == n.ID || leaderId <= 0 {
+			return nil, status.Errorf(codes.Unavailable, "no leader available (node %d state=%s)", n.ID, state)
 		}
 
-		return &pb.ClientResponse{
-			Success: false,
-			Message: fmt.Sprintf("No leader available (state=%s)", state),
-		}, nil
+		log.Printf("[Node %d] Not leader (state=%s, leader=%d), redirecting", n.ID, state, leaderId)
+		if peer, ok := n.Peers[leaderId]; ok {
+			return peer.ProcessRequest(forwardCtx(ctx), req)
+		}
+		return nil, status.Errorf(codes.Unavailable, "no leader available (node %d state=%s)", n.ID, state)
 	}
+
+	// Duplicate of a request whose outcome is already in the replicated log
+	if req.Type == pb.ClientRequest_TRANSFER {
+		if lastReply, ok := n.clientLastReply[req.RequestId]; ok {
+			n.mu.Unlock()
+			log.Printf("[Node %d] Deduplication cache hit for %s", n.ID, req.RequestId)
+			return lastReply, nil
+		}
+	}
+
+	// Track start time for latency measurement
+	n.txnStartTimes[req.RequestId] = time.Now()
 	n.mu.Unlock()
 
 	log.Printf("[Node %d] Leader processing request: %v", n.ID, req.Type)
@@ -354,12 +480,20 @@ func (n *Node) ProcessRequest(ctx context.Context, req *pb.ClientRequest) (*pb.C
 		}, nil
 	}
 
+	if req.Transaction == nil {
+		return &pb.ClientResponse{Success: false, Message: "Missing transaction", RequestId: req.RequestId}, nil
+	}
+
 	// Transfer transaction - requires consensus
 	sender := req.Transaction.Sender
 	receiver := req.Transaction.Receiver
 
 	senderShard := n.getShardForClient(sender)
 	receiverShard := n.getShardForClient(receiver)
+
+	if receiverShard == -1 {
+		return &pb.ClientResponse{Success: false, Message: "Invalid receiver", RequestId: req.RequestId}, nil
+	}
 
 	if senderShard == receiverShard && senderShard == n.ClusterID {
 		// Intra-shard transaction
@@ -380,6 +514,7 @@ func (n *Node) processIntraShardTransaction(ctx context.Context, req *pb.ClientR
 
 	sender := req.Transaction.Sender
 	receiver := req.Transaction.Receiver
+	amount := req.Transaction.Amount
 
 	// Check locks
 	if n.Locks[sender] || n.Locks[receiver] {
@@ -387,6 +522,18 @@ func (n *Node) processIntraShardTransaction(ctx context.Context, req *pb.ClientR
 		return &pb.ClientResponse{
 			Success:   false,
 			Message:   "Data items are locked",
+			RequestId: req.RequestId,
+		}, nil
+	}
+
+	// Check the balance before running consensus (the transfer used to be reported
+	// as committed even when execution skipped it for insufficient funds)
+	senderBalance, err := n.getBalanceFromDB(sender)
+	if err != nil || senderBalance < amount {
+		n.mu.Unlock()
+		return &pb.ClientResponse{
+			Success:   false,
+			Message:   "Insufficient balance",
 			RequestId: req.RequestId,
 		}, nil
 	}
@@ -403,6 +550,7 @@ func (n *Node) processIntraShardTransaction(ctx context.Context, req *pb.ClientR
 	// Release locks
 	delete(n.Locks, sender)
 	delete(n.Locks, receiver)
+	stillLeader := n.isReadyLeader()
 	n.mu.Unlock()
 
 	if success {
@@ -414,9 +562,13 @@ func (n *Node) processIntraShardTransaction(ctx context.Context, req *pb.ClientR
 		}, nil
 	}
 
+	if !stillLeader {
+		// Lost leadership mid-request: let the client retry at the new leader
+		return nil, status.Error(codes.Unavailable, "leadership changed during consensus")
+	}
 	return &pb.ClientResponse{
 		Success:   false,
-		Message:   "Consensus failed",
+		Message:   "Consensus failed (no majority in cluster)",
 		RequestId: req.RequestId,
 	}, nil
 }
@@ -452,13 +604,16 @@ func (n *Node) processCrossShardTransaction(ctx context.Context, req *pb.ClientR
 	n.Locks[sender] = true
 	n.mu.Unlock()
 
-	// Phase 1: Prepare phase for coordinator
-	// Run Paxos with phase "P"
-	success := n.runPaxosConsensus(ctx, req, "P")
-	if !success {
+	releaseSender := func() {
 		n.mu.Lock()
 		delete(n.Locks, sender)
 		n.mu.Unlock()
+	}
+
+	// Phase 1: Prepare phase for coordinator
+	// Run Paxos with phase "P" (debits the sender and writes the WAL on every replica)
+	if !n.runPaxosConsensus(ctx, req, "P") {
+		releaseSender()
 		return &pb.ClientResponse{
 			Success:   false,
 			Message:   "Coordinator prepare failed",
@@ -466,70 +621,73 @@ func (n *Node) processCrossShardTransaction(ctx context.Context, req *pb.ClientR
 		}, nil
 	}
 
-	// Execute transaction locally and save to WAL
-	//n.executeAndLogTransaction(req, sender, -amount)
-
-	// Send prepare to participant with timeout
+	// Send prepare to the participant cluster's current leader
 	participantShard := n.getShardForClient(receiver)
-	participantLeader := n.getLeaderForShard(participantShard)
-
 	prepareMsg := &pb.TwoPCPrepare{
 		Transaction:     req.Transaction,
 		OriginalRequest: req,
 		RequestId:       req.RequestId,
 	}
 
-	// FIX 1: Add timeout context for prepare phase
-	prepareCtx, prepareCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer prepareCancel()
+	var preparedResp *pb.TwoPCPrepared
+	err = n.callParticipant(ctx, participantShard, 3*time.Second, func(c context.Context, p pb.NodeServiceClient) (bool, error) {
+		resp, err := p.Send2PCPrepare(c, prepareMsg)
+		if err != nil {
+			return false, err
+		}
+		preparedResp = resp
+		return true, nil
+	})
 
-	preparedResp, err := participantLeader.Send2PCPrepare(prepareCtx, prepareMsg)
-
-	if err != nil || !preparedResp.Success {
-		// Abort due to participant failure or timeout
+	if err != nil || preparedResp == nil || !preparedResp.Success {
+		// Abort: replicate the abort record locally (undoes the debit via WAL) and
+		// tell the participant, which may have prepared before its reply was lost.
 		log.Printf("[Node %d] Participant prepare failed or timeout: %v", n.ID, err)
 		n.abort2PCTransaction(ctx, req)
+
+		abortMsg := &pb.TwoPCAbort{Transaction: req.Transaction, RequestId: req.RequestId}
+		n.callParticipant(ctx, participantShard, 1*time.Second, func(c context.Context, p pb.NodeServiceClient) (bool, error) {
+			ack, err := p.Send2PCAbort(c, abortMsg)
+			if err != nil {
+				return false, err
+			}
+			return ack.Success, nil
+		})
+
 		n.recordLatency(req.RequestId)
+		reason := "Participant prepare failed or timeout"
+		if err == nil && preparedResp != nil {
+			reason = "Participant aborted (receiver locked or no majority)"
+		}
 		return &pb.ClientResponse{
 			Success:   false,
-			Message:   "Participant prepare failed or timeout",
+			Message:   "Transaction aborted: " + reason,
 			RequestId: req.RequestId,
 		}, nil
 	}
 
 	// Phase 2: Commit phase
+	// Run Paxos for commit with phase "C"
+	if !n.runPaxosConsensus(ctx, req, "C") {
+		log.Printf("[Node %d] Warning: could not replicate commit record for %s", n.ID, req.RequestId)
+	}
+
+	// Send commit to participant with retry and wait for ACK
 	commitMsg := &pb.TwoPCCommit{
 		Transaction: req.Transaction,
 		RequestId:   req.RequestId,
 	}
-
-	// Run Paxos for commit with phase "C"
-	n.runPaxosConsensus(ctx, req, "C")
-
-	// FIX 2: Send commit to participant with retry and wait for ACK
-	maxRetries := 3
-	ackReceived := false
-
-	for i := 0; i < maxRetries; i++ {
-		commitCtx, commitCancel := context.WithTimeout(ctx, 2*time.Second)
-		ack, err := participantLeader.Send2PCCommit(commitCtx, commitMsg)
-		commitCancel()
-
-		if err == nil && ack != nil && ack.Success {
-			ackReceived = true
-			log.Printf("[Node %d] Received ACK from participant", n.ID)
-			break
+	ackErr := n.callParticipant(ctx, participantShard, 3*time.Second, func(c context.Context, p pb.NodeServiceClient) (bool, error) {
+		ack, err := p.Send2PCCommit(c, commitMsg)
+		if err != nil {
+			return false, err
 		}
-
-		if i < maxRetries-1 {
-			log.Printf("[Node %d] Retrying 2PC commit (%d/%d)", n.ID, i+1, maxRetries)
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	if !ackReceived {
-		log.Printf("[Node %d] Warning: ACK not received from participant after retries", n.ID)
-		// Continue anyway - participant should have committed via Paxos
+		return ack.Success, nil
+	})
+	if ackErr != nil {
+		log.Printf("[Node %d] Warning: ACK not received from participant: %v", n.ID, ackErr)
+	} else {
+		log.Printf("[Node %d] Received ACK from participant", n.ID)
 	}
 
 	// Release lock and clear WAL
@@ -544,6 +702,51 @@ func (n *Node) processCrossShardTransaction(ctx context.Context, req *pb.ClientR
 		Message:   "Cross-shard transaction committed",
 		RequestId: req.RequestId,
 	}, nil
+}
+
+// callParticipant sends a 2PC message to whichever node currently leads the given
+// cluster. It tries the node that answered last time first, then the others, and
+// keeps going until one of them answers or the window expires (covers elections).
+// call returns (done, err): done=true stops the loop.
+func (n *Node) callParticipant(ctx context.Context, clusterID int32, window time.Duration, call func(context.Context, pb.NodeServiceClient) (bool, error)) error {
+	n.mu.RLock()
+	clients := n.ClusterClients[clusterID]
+	hint := n.participantHint[clusterID]
+	n.mu.RUnlock()
+
+	if len(clients) == 0 {
+		if c := n.CoordinatorClients[clusterID]; c != nil {
+			clients = []pb.NodeServiceClient{c}
+		} else {
+			return fmt.Errorf("no connection to cluster %d", clusterID)
+		}
+	}
+
+	deadline := time.Now().Add(window)
+	var lastErr error
+	for {
+		for i := 0; i < len(clients); i++ {
+			idx := (hint + i) % len(clients)
+			callCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			done, err := call(callCtx, clients[idx])
+			cancel()
+			if err == nil {
+				n.mu.Lock()
+				n.participantHint[clusterID] = idx
+				n.mu.Unlock()
+				if done {
+					return nil
+				}
+				lastErr = fmt.Errorf("participant cluster %d did not acknowledge", clusterID)
+				continue
+			}
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // Helper functions
@@ -565,15 +768,15 @@ func (n *Node) getShardForClient(clientID int32) int32 {
 }
 
 func (n *Node) getLeaderForShard(shardID int32) pb.NodeServiceClient {
-	// This should return the gRPC client for the leader of the specified shard
+	// Default leader of the shard; callParticipant finds the current one
 	return n.CoordinatorClients[shardID]
 }
 
-// runPaxosConsensus executes stable leader Multi-Paxos
+// runPaxosConsensus executes stable leader Multi-Paxos for the next sequence number.
 func (n *Node) runPaxosConsensus(ctx context.Context, req *pb.ClientRequest, phase string) bool {
 	n.mu.Lock()
 
-	if n.State != "LEADER" {
+	if n.State != "LEADER" || n.Failed {
 		n.mu.Unlock()
 		return false
 	}
@@ -581,7 +784,35 @@ func (n *Node) runPaxosConsensus(ctx context.Context, req *pb.ClientRequest, pha
 	// Assign sequence number
 	n.SequenceNumber++
 	seqNum := n.SequenceNumber
+	n.mu.Unlock()
+
+	if n.proposeAt(seqNum, req, phase) {
+		return true
+	}
+
+	// No majority: roll the slot back so it does not leave a permanent gap that
+	// blocks execution of every later entry. No other replica accepted it.
+	n.mu.Lock()
+	if entry, ok := n.AcceptedValues[seqNum]; ok && !entry.Committed {
+		delete(n.AcceptedValues, seqNum)
+		delete(n.AcceptedCount, seqNum)
+		if n.SequenceNumber == seqNum {
+			n.SequenceNumber--
+		}
+	}
+	n.mu.Unlock()
+	return false
+}
+
+// proposeAt runs the accept phase for one slot and commits it on a majority.
+func (n *Node) proposeAt(seqNum int32, req *pb.ClientRequest, phase string) bool {
+	n.mu.Lock()
+	if n.State != "LEADER" || n.Failed {
+		n.mu.Unlock()
+		return false
+	}
 	ballotNum := n.BallotNumber
+	epoch := n.epoch
 
 	// Mark as PROPOSED
 	n.AcceptedValues[seqNum] = &pb.LogEntry{
@@ -609,13 +840,16 @@ func (n *Node) runPaxosConsensus(ctx context.Context, req *pb.ClientRequest, pha
 		SenderId:       n.ID,
 	}
 
+	acceptCtx, cancel := context.WithTimeout(withEpoch(context.Background(), epoch), AcceptWait)
+	defer cancel()
+
 	// Broadcast accept to all peers
 	var wg sync.WaitGroup
 	for peerID, peer := range n.Peers {
 		wg.Add(1)
 		go func(pid int32, p pb.NodeServiceClient) {
 			defer wg.Done()
-			resp, err := p.SendAccept(ctx, acceptMsg)
+			resp, err := p.SendAccept(acceptCtx, acceptMsg)
 			if err == nil && resp.Accepted {
 				n.handleAcceptedReply(seqNum, pid, ballotNum)
 			}
@@ -631,20 +865,19 @@ func (n *Node) runPaxosConsensus(ctx context.Context, req *pb.ClientRequest, pha
 
 	select {
 	case <-done:
-	case <-time.After(500 * time.Millisecond):
+	case <-acceptCtx.Done():
 	}
 
 	// Check if we have quorum
 	n.mu.Lock()
-	majority := (len(n.ClusterNodes) + 1) / 2
 	acceptCount := len(n.AcceptedCount[seqNum])
-	hasQuorum := acceptCount >= majority
+	hasQuorum := acceptCount >= n.majority() && n.State == "LEADER" && n.BallotNumber == ballotNum && n.epoch == epoch
 	n.mu.Unlock()
 
 	if hasQuorum {
 		log.Printf("[Node %d] Quorum reached for seq=%d (%d/%d)", n.ID, seqNum, acceptCount, len(n.ClusterNodes))
 		// Broadcast commit
-		n.broadcastCommit(ctx, seqNum, req, phase)
+		n.broadcastCommit(seqNum, req, phase, epoch)
 		return true
 	}
 
@@ -668,22 +901,24 @@ func (n *Node) handleAcceptedReply(seqNum, acceptorID, ballotNum int32) {
 	n.AcceptedCount[seqNum][acceptorID] = true
 
 	// Check if we now have quorum
-	majority := (len(n.ClusterNodes) + 1) / 2
-	if len(n.AcceptedCount[seqNum]) >= majority {
+	if len(n.AcceptedCount[seqNum]) >= n.majority() {
 		// Quorum achieved - will commit
 		log.Printf("[Node %d] Quorum achieved for seq=%d", n.ID, seqNum)
 	}
 }
 
 // broadcastCommit sends commit messages to all replicas
-func (n *Node) broadcastCommit(ctx context.Context, seqNum int32, req *pb.ClientRequest, phase string) {
+func (n *Node) broadcastCommit(seqNum int32, req *pb.ClientRequest, phase string, epoch int64) {
 	n.mu.Lock()
 
 	// Mark as committed locally
-	if entry, ok := n.AcceptedValues[seqNum]; ok {
-		entry.Committed = true
-		n.CommittedLog[seqNum] = entry
+	entry, ok := n.AcceptedValues[seqNum]
+	if !ok {
+		entry = &pb.LogEntry{SequenceNumber: seqNum, BallotNumber: n.BallotNumber, Request: req, Phase: phase}
+		n.AcceptedValues[seqNum] = entry
 	}
+	entry.Committed = true
+	n.CommittedLog[seqNum] = entry
 
 	n.mu.Unlock()
 
@@ -695,13 +930,11 @@ func (n *Node) broadcastCommit(ctx context.Context, seqNum int32, req *pb.Client
 
 	// Execute locally first
 	n.executeLog()
-	bgCtx := context.Background()
 
 	// Broadcast to peers
 	for _, peer := range n.Peers {
 		go func(p pb.NodeServiceClient) {
-			// Give it a reasonable timeout (e.g., 2 seconds)
-			commitCtx, cancel := context.WithTimeout(bgCtx, 1*time.Second)
+			commitCtx, cancel := context.WithTimeout(withEpoch(context.Background(), epoch), 1*time.Second)
 			defer cancel()
 			p.SendCommit(commitCtx, commitMsg)
 		}(peer)
@@ -727,17 +960,6 @@ func (n *Node) executeLog() {
 		n.LastExecutedSeq = nextSeq
 
 		log.Printf("[Node %d] Executed seq=%d", n.ID, nextSeq)
-
-		// Store reply for client deduplication
-		if n.State == "LEADER" && entry.Request != nil {
-			// FIX: Use RequestId here too
-			reqKey := entry.Request.RequestId
-			n.clientLastReply[reqKey] = &pb.ClientResponse{
-				Success:   true,
-				Message:   "Transaction committed",
-				RequestId: entry.Request.RequestId,
-			}
-		}
 	}
 }
 
@@ -754,9 +976,24 @@ func (n *Node) isLocal(clientID int32) bool {
 	return false
 }
 
+// recordOutcome stores the final result of a request so a retransmission gets the
+// same answer instead of running the transaction again. Every replica records it
+// while executing the log, so a new leader knows it too.
+// MUST be called with the lock held.
+func (n *Node) recordOutcome(reqID string, success bool, message string) {
+	n.clientLastReply[reqID] = &pb.ClientResponse{
+		Success:   success,
+		Message:   message,
+		RequestId: reqID,
+	}
+}
+
 // executeTransactionUnlocked executes without acquiring lock
 func (n *Node) executeTransactionUnlocked(req *pb.ClientRequest, phase string) {
-	if req.Type == pb.ClientRequest_TRANSFER {
+	if req == nil || phase == PhaseNoOp || phase == PhaseHeartbeat {
+		return
+	}
+	if req.Type == pb.ClientRequest_TRANSFER && req.Transaction != nil {
 		sender := req.Transaction.Sender
 		receiver := req.Transaction.Receiver
 		amount := req.Transaction.Amount
@@ -769,6 +1006,7 @@ func (n *Node) executeTransactionUnlocked(req *pb.ClientRequest, phase string) {
 		// Action: Finalize. Balance already updated in "P". Just clear WAL.
 		if phase == "C" {
 			delete(n.WAL, reqID)
+			n.recordOutcome(reqID, true, "Cross-shard transaction committed")
 			return
 		}
 
@@ -776,17 +1014,21 @@ func (n *Node) executeTransactionUnlocked(req *pb.ClientRequest, phase string) {
 		// Action: Undo changes using WAL.
 		if phase == "A" {
 			if entries, ok := n.WAL[reqID]; ok {
-				for _, entry := range entries {
-					n.DB.Exec("UPDATE balances SET balance = ? WHERE client_id = ?", entry.OldBalance, entry.DataItem)
+				for i := len(entries) - 1; i >= 0; i-- {
+					n.DB.Exec("UPDATE balances SET balance = ? WHERE client_id = ?", entries[i].OldBalance, entries[i].DataItem)
 				}
 				delete(n.WAL, reqID)
 			}
+			n.recordOutcome(reqID, false, "Transaction aborted")
 			return
 		}
 
 		// --- PHASE: PREPARE ("P") ---
 		// Action: Apply Balance Changes & Log to WAL
 		if phase == "P" {
+			if _, done := n.WAL[reqID]; done {
+				return // already prepared (duplicate prepare record)
+			}
 			// Coordinator Side (Sender)
 			if senderLocal {
 				n.applyUpdateWithWAL(reqID, sender, -amount)
@@ -800,12 +1042,16 @@ func (n *Node) executeTransactionUnlocked(req *pb.ClientRequest, phase string) {
 
 		// --- PHASE: NORMAL / INTRA-SHARD ("") ---
 		// Action: Atomic Transfer (Sender & Receiver are likely local)
+		if _, done := n.clientLastReply[reqID]; done {
+			return // the same request was already executed at an earlier slot
+		}
 		if senderLocal {
 			// 1. Check Balance
 			var senderBalance int32
 			err := n.DB.QueryRow("SELECT balance FROM balances WHERE client_id = ?", sender).Scan(&senderBalance)
 			if err != nil || senderBalance < amount {
 				log.Printf("[Node %d] Intra-shard execution failed: insufficient funds/error", n.ID)
+				n.recordOutcome(reqID, false, "Insufficient balance")
 				return
 			}
 
@@ -816,6 +1062,7 @@ func (n *Node) executeTransactionUnlocked(req *pb.ClientRequest, phase string) {
 			if receiverLocal {
 				n.DB.Exec("UPDATE balances SET balance = balance + ? WHERE client_id = ?", amount, receiver)
 			}
+			n.recordOutcome(reqID, true, "Transaction committed")
 		}
 	}
 }
@@ -852,16 +1099,19 @@ func (n *Node) applyUpdateWithWAL(reqID string, clientID, delta int32) {
 }
 
 func (n *Node) abort2PCTransaction(ctx context.Context, req *pb.ClientRequest) {
-	// Run Paxos for abort
-	n.runPaxosConsensus(ctx, req, "A")
-
-	// Undo using WAL
-	n.mu.Lock()
-	walEntries := n.WAL[req.RequestId]
-	for _, entry := range walEntries {
-		n.DB.Exec("UPDATE balances SET balance = ? WHERE client_id = ?", entry.OldBalance, entry.DataItem)
+	// Run Paxos for abort: every replica undoes the prepare using its WAL
+	if !n.runPaxosConsensus(ctx, req, "A") {
+		// Could not replicate the abort record; at least undo locally
+		n.mu.Lock()
+		walEntries := n.WAL[req.RequestId]
+		for i := len(walEntries) - 1; i >= 0; i-- {
+			n.DB.Exec("UPDATE balances SET balance = ? WHERE client_id = ?", walEntries[i].OldBalance, walEntries[i].DataItem)
+		}
+		delete(n.WAL, req.RequestId)
+		n.mu.Unlock()
 	}
-	delete(n.WAL, req.RequestId)
+
+	n.mu.Lock()
 	delete(n.Locks, req.Transaction.Sender)
 	n.mu.Unlock()
 }
@@ -883,84 +1133,102 @@ func (n *Node) SendAccept(ctx context.Context, msg *pb.AcceptMessage) (*pb.Accep
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.Failed {
+	if n.Failed || !n.epochOK(ctx) {
 		return &pb.AcceptedMessage{Accepted: false}, nil
 	}
 
-	// Accept if ballot number is >= current ballot
-	if msg.BallotNumber >= n.BallotNumber {
-		n.BallotNumber = msg.BallotNumber
+	// Reject proposals from an older ballot (and say which ballot we promised)
+	if msg.BallotNumber < n.BallotNumber {
+		return &pb.AcceptedMessage{Accepted: false, BallotNumber: n.BallotNumber, SenderId: n.ID}, nil
+	}
+	n.BallotNumber = msg.BallotNumber
 
-		// Update leader if not self
-		if msg.SenderId != n.ID && n.State != "LEADER" {
-			n.State = "FOLLOWER"
-			n.CurrentLeader = msg.SenderId
-			n.IsLeader = false
-			n.resetFollowerTimer() // Reset timer on ANY message from leader
+	// Any message from the current leader makes us its follower
+	if msg.SenderId != n.ID {
+		if n.State != "FOLLOWER" || n.CurrentLeader != msg.SenderId {
+			log.Printf("[Node %d] Following leader %d (ballot %d)", n.ID, msg.SenderId, msg.BallotNumber)
 		}
+		n.becomeFollower(msg.SenderId) // also resets the follower timer
+	}
 
-		// Handle heartbeat message
-		if msg.SequenceNumber == 0 && msg.Phase == "HEARTBEAT" {
-			return &pb.AcceptedMessage{
-				Accepted:       true,
-				BallotNumber:   msg.BallotNumber,
-				SequenceNumber: n.LastExecutedSeq,
-				SenderId:       n.ID,
-			}, nil
-		}
-
-		// Store in accepted values (ACCEPTED state) for real transactions
-		n.AcceptedValues[msg.SequenceNumber] = &pb.LogEntry{
-			SequenceNumber: msg.SequenceNumber,
-			BallotNumber:   msg.BallotNumber,
-			Request:        msg.Request,
-			Phase:          msg.Phase,
-			Committed:      false,
-		}
-
-		// Update sequence number to max seen
-		if msg.SequenceNumber > n.SequenceNumber {
-			n.SequenceNumber = msg.SequenceNumber
-		}
-
-		log.Printf("[Node %d] Accepted seq=%d from leader %d", n.ID, msg.SequenceNumber, msg.SenderId)
-
+	// Handle heartbeat message. It carries the leader's last executed seq, which is
+	// not 0 after the first transaction, so it is matched on the phase alone.
+	if msg.Phase == PhaseHeartbeat {
 		return &pb.AcceptedMessage{
 			Accepted:       true,
+			BallotNumber:   msg.BallotNumber,
+			SequenceNumber: n.LastExecutedSeq,
+			SenderId:       n.ID,
+		}, nil
+	}
+
+	// A slot that is already chosen keeps its value
+	if committed, ok := n.CommittedLog[msg.SequenceNumber]; ok {
+		same := committed.Request != nil && msg.Request != nil &&
+			committed.Request.RequestId == msg.Request.RequestId && committed.Phase == msg.Phase
+		return &pb.AcceptedMessage{
+			Accepted:       same,
 			BallotNumber:   msg.BallotNumber,
 			SequenceNumber: msg.SequenceNumber,
 			SenderId:       n.ID,
 		}, nil
 	}
 
-	return &pb.AcceptedMessage{Accepted: false}, nil
+	// Store in accepted values (ACCEPTED state) for real transactions
+	n.AcceptedValues[msg.SequenceNumber] = &pb.LogEntry{
+		SequenceNumber: msg.SequenceNumber,
+		BallotNumber:   msg.BallotNumber,
+		Request:        msg.Request,
+		Phase:          msg.Phase,
+		Committed:      false,
+	}
+
+	// Update sequence number to max seen
+	if msg.SequenceNumber > n.SequenceNumber {
+		n.SequenceNumber = msg.SequenceNumber
+	}
+
+	log.Printf("[Node %d] Accepted seq=%d from leader %d", n.ID, msg.SequenceNumber, msg.SenderId)
+
+	return &pb.AcceptedMessage{
+		Accepted:       true,
+		BallotNumber:   msg.BallotNumber,
+		SequenceNumber: msg.SequenceNumber,
+		SenderId:       n.ID,
+	}, nil
 }
 
 // SendCommit handles commit messages (Multi-Paxos commit phase)
 func (n *Node) SendCommit(ctx context.Context, msg *pb.CommitMessage) (*pb.Empty, error) {
 	n.mu.Lock()
 
-	if n.Failed {
+	if n.Failed || !n.epochOK(ctx) {
 		n.mu.Unlock()
 		return &pb.Empty{}, nil
 	}
 
 	seq := msg.SequenceNumber
 
-	// Mark as committed (COMMITTED state)
-	if entry, ok := n.AcceptedValues[seq]; ok {
-		entry.Committed = true
-		n.CommittedLog[seq] = entry
-		log.Printf("[Node %d] Committed seq=%d", n.ID, seq)
-	} else {
-		// Commit for something we haven't accepted - store it anyway
-		n.CommittedLog[seq] = &pb.LogEntry{
+	if _, done := n.CommittedLog[seq]; !done {
+		// The commit carries the chosen value; it wins over whatever this replica
+		// accepted for the slot (possibly from a deposed leader).
+		ballot := int32(0)
+		if accepted, ok := n.AcceptedValues[seq]; ok {
+			ballot = accepted.BallotNumber
+		}
+		entry := &pb.LogEntry{
 			SequenceNumber: seq,
+			BallotNumber:   ballot,
 			Request:        msg.Request,
 			Phase:          msg.Phase,
 			Committed:      true,
 		}
-		log.Printf("[Node %d] Committed seq=%d (late commit)", n.ID, seq)
+		n.AcceptedValues[seq] = entry
+		n.CommittedLog[seq] = entry
+		if seq > n.SequenceNumber {
+			n.SequenceNumber = seq
+		}
+		log.Printf("[Node %d] Committed seq=%d", n.ID, seq)
 	}
 
 	n.mu.Unlock()
@@ -972,13 +1240,18 @@ func (n *Node) SendCommit(ctx context.Context, msg *pb.CommitMessage) (*pb.Empty
 }
 
 // resetFollowerTimer resets the follower timeout timer
+// MUST be called with the lock held.
 func (n *Node) resetFollowerTimer() {
 	if n.followerTimer != nil {
 		n.followerTimer.Stop()
+		n.followerTimer = nil
+	}
+	if n.Failed {
+		return
 	}
 
-	jitter := time.Duration(rand.Intn(50)) * time.Millisecond
-	timeoutDuration := 120*time.Millisecond + jitter
+	jitter := time.Duration(rand.Int63n(int64(FollowerTimeoutJitter)))
+	timeoutDuration := FollowerTimeoutBase + jitter
 	n.followerTimer = time.AfterFunc(timeoutDuration, func() {
 		n.handleFollowerTimeout()
 	})
@@ -994,7 +1267,7 @@ func (n *Node) handleFollowerTimeout() {
 	n.mu.Unlock()
 
 	log.Printf("[Node %d] Follower timeout - starting election", n.ID)
-	n.StartLeaderElection(context.Background())
+	n.runElection(false)
 }
 
 // FailNode simulates node failure
@@ -1007,7 +1280,12 @@ func (n *Node) FailNode(ctx context.Context, _ *pb.Empty) (*pb.Empty, error) {
 		n.followerTimer.Stop()
 		n.followerTimer = nil
 	}
-	// Note: Heartbeat will automatically stop when State != "LEADER" or Failed = true
+	if n.State == "LEADER" || n.IsLeader {
+		// A failed leader stops heartbeating, so its followers elect a new one
+		n.State = "FOLLOWER"
+		n.IsLeader = false
+		n.leaderGen++
+	}
 	log.Printf("Node %d failed", n.ID)
 	return &pb.Empty{}, nil
 }
@@ -1016,15 +1294,23 @@ func (n *Node) FailNode(ctx context.Context, _ *pb.Empty) (*pb.Empty, error) {
 func (n *Node) RecoverNode(ctx context.Context, _ *pb.Empty) (*pb.Empty, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	wasFailed := n.Failed
 	n.Failed = false
 
-	if n.State == "LEADER" {
-		log.Printf("Node %d recovering: Stepping down from LEADER to FOLLOWER", n.ID)
-		n.State = "FOLLOWER"
-		n.IsLeader = false
+	if !wasFailed {
+		// Already up: keep whatever role it has
+		if n.State != "LEADER" {
+			n.resetFollowerTimer()
+		}
+		return &pb.Empty{}, nil
 	}
 
-	n.resetFollowerTimer()
+	if n.State == "LEADER" || n.IsLeader {
+		log.Printf("Node %d recovering: Stepping down from LEADER to FOLLOWER", n.ID)
+	}
+	// Rejoin as a follower; the leader's heartbeats bring the log up to date.
+	n.becomeFollower(n.CurrentLeader)
 
 	log.Printf("Node %d recovered", n.ID)
 	return &pb.Empty{}, nil
@@ -1034,6 +1320,9 @@ func (n *Node) RecoverNode(ctx context.Context, _ *pb.Empty) (*pb.Empty, error) 
 func (n *Node) Flush() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// Messages still in flight from the previous set are dropped from now on
+	n.epoch++
 
 	// Reset all state
 	n.SequenceNumber = 0
@@ -1047,6 +1336,9 @@ func (n *Node) Flush() {
 	n.txnStartTimes = make(map[string]time.Time)
 	n.completedTxns = 0
 	n.totalLatency = 0
+	n.PeerSyncStatus = make(map[int32]bool)
+	n.preparedTxns = make(map[string]int32)
+	n.Recovering = false
 
 	n.clientLastReply = make(map[string]*pb.ClientResponse)
 	n.seenRequests = make(map[string]int64)

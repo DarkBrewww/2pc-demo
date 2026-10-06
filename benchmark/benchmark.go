@@ -76,8 +76,8 @@ func (b *Benchmark) Run(ctx context.Context) (*BenchmarkResults, error) {
 		if isReadOnly {
 			// Generate read-only transaction
 			clientID := b.selectClient()
-			_, err := b.client.SendBalanceRequest(ctx, clientID)
-			if err == nil {
+			resp, err := b.client.SendBalanceRequest(ctx, clientID)
+			if err == nil && resp.Success {
 				results.SuccessfulReads++
 			} else {
 				results.FailedReads++
@@ -89,8 +89,10 @@ func (b *Benchmark) Run(ctx context.Context) (*BenchmarkResults, error) {
 			sender, receiver := b.selectTransferPair(isCrossShard)
 			amount := int32(b.rand.Intn(5) + 1) // Random amount 1-5
 
-			_, err := b.client.SendTransferRequest(ctx, sender, receiver, amount)
-			if err == nil {
+			// A rejected transfer (e.g. insufficient balance) is now returned without an
+			// error, so count it as failed explicitly.
+			resp, err := b.client.SendTransferRequest(ctx, sender, receiver, amount)
+			if err == nil && resp.Success {
 				results.SuccessfulWrites++
 				if isCrossShard {
 					results.CrossShardTxns++

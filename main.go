@@ -213,23 +213,36 @@ func (sys *System) ConnectPeers() error {
 				}
 			}
 
-			// Connect to leaders of other clusters
+			// Connect to every node of the other clusters. 2PC messages go to whichever
+			// of them currently leads (the default leader may have failed).
 			for otherClusterID := int32(1); otherClusterID <= 3; otherClusterID++ {
 				if otherClusterID != clusterID {
-					// Connect to first node (default leader) of other cluster
-					leaderNode := clusterNodes[otherClusterID][0]
-					conn, err := grpc.Dial(leaderNode.Port, grpc.WithInsecure())
-					if err != nil {
-						return err
+					for i, other := range clusterNodes[otherClusterID] {
+						conn, err := grpc.Dial(other.Port, grpc.WithInsecure())
+						if err != nil {
+							return err
+						}
+						client := pb.NewNodeServiceClient(conn)
+						n.ClusterClients[otherClusterID] = append(n.ClusterClients[otherClusterID], client)
+						if i == 0 {
+							// First node (default leader) of other cluster
+							n.CoordinatorClients[otherClusterID] = client
+						}
 					}
-					client := pb.NewNodeServiceClient(conn)
-					n.CoordinatorClients[otherClusterID] = client
 				}
 			}
 		}
 	}
 
 	return nil
+}
+
+// parseNodeID turns "n_3" (or "n3") into 3.
+func parseNodeID(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "n_")
+	s = strings.TrimPrefix(s, "n")
+	return strconv.Atoi(strings.TrimSpace(s))
 }
 
 func (sys *System) RunTests(testFile string) error {
@@ -316,9 +329,7 @@ func (sys *System) ParseTestSets(records [][]string) map[int]*TestSet {
 		if len(testSets[setNum].LiveNodes) == 0 {
 			nodeStrs := strings.Split(liveNodesStr, ",")
 			for _, nodeStr := range nodeStrs {
-				nodeStr = strings.TrimSpace(nodeStr)
-				nodeStr = strings.TrimPrefix(nodeStr, "n")
-				if nodeID, err := strconv.Atoi(nodeStr); err == nil {
+				if nodeID, err := parseNodeID(nodeStr); err == nil {
 					testSets[setNum].LiveNodes = append(testSets[setNum].LiveNodes, int32(nodeID))
 				}
 			}
@@ -387,9 +398,9 @@ func (sys *System) ProcessTestSet(testSet *TestSet) {
 
 		// --- Handle Fail Command F(n_x) ---
 		if strings.HasPrefix(txn, "F(") {
-			nodeStr := strings.TrimPrefix(txn, "F(n")
+			nodeStr := strings.TrimPrefix(txn, "F(")
 			nodeStr = strings.TrimSuffix(nodeStr, ")")
-			nodeID, _ := strconv.Atoi(nodeStr)
+			nodeID, _ := parseNodeID(nodeStr)
 			if nodeID >= 1 && nodeID <= 9 {
 				sys.nodes[nodeID-1].FailNode(ctx, &pb.Empty{})
 				// Update live map so we don't accidentally jumpstart it if logic reruns (optional)
@@ -400,9 +411,9 @@ func (sys *System) ProcessTestSet(testSet *TestSet) {
 
 		// --- Handle Recover Command R(n_x) ---
 		if strings.HasPrefix(txn, "R(") {
-			nodeStr := strings.TrimPrefix(txn, "R(n")
+			nodeStr := strings.TrimPrefix(txn, "R(")
 			nodeStr = strings.TrimSuffix(nodeStr, ")")
-			nodeID, _ := strconv.Atoi(nodeStr)
+			nodeID, _ := parseNodeID(nodeStr)
 			if nodeID >= 1 && nodeID <= 9 {
 				sys.nodes[nodeID-1].RecoverNode(ctx, &pb.Empty{})
 				liveNodeMap[int32(nodeID)] = true
@@ -420,6 +431,8 @@ func (sys *System) ProcessTestSet(testSet *TestSet) {
 			resp, err := sys.client.SendBalanceRequest(ctx, int32(clientID))
 			if err != nil {
 				log.Printf("Balance query failed: %v", err)
+			} else if !resp.Success {
+				log.Printf("Balance query failed: %s", resp.Message)
 			} else {
 				log.Printf("Balance of %d: %d", clientID, resp.Balance)
 			}
